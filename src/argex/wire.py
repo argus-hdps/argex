@@ -1,0 +1,89 @@
+"""Decoders for the server's binary responses (all little-endian).
+
+/segments.bin   four columns of N values each: u32 seg, u32 n_frames,
+                f8 epoch_min, f8 epoch_max
+/coverage       u32 count per segment, aligned to /segments.bin
+/tile/...       one tile x tile fp16 tile, row-major; the frame epoch (if
+                native) in the X-Epoch-Tt header
+/tiles/...      f8 epoch, u32 count, then count x (u8 x, u8 y,
+                tile x tile fp16); epoch is NaN for pyramid levels and for
+                an empty batch
+"""
+
+import struct
+
+import numpy as np
+
+from .errors import DecodeError
+
+_TILES_HEADER = struct.Struct("<dI")
+_XY = struct.Struct("<BB")
+
+
+def decode_segments(blob):
+    """/segments.bin -> dict of equal-length arrays (seg, n_frames,
+    epoch_min, epoch_max)."""
+    if len(blob) % 24:
+        raise DecodeError(f"segments.bin: {len(blob)} B is not a multiple of 24")
+    n = len(blob) // 24
+    return {
+        "seg": np.frombuffer(blob, "<u4", n, 0).astype(np.int64),
+        "n_frames": np.frombuffer(blob, "<u4", n, 4 * n).astype(np.int64),
+        "epoch_min": np.frombuffer(blob, "<f8", n, 8 * n).copy(),
+        "epoch_max": np.frombuffer(blob, "<f8", n, 16 * n).copy(),
+    }
+
+
+def decode_coverage(blob, n_segments=None):
+    """/coverage -> int64 count per segment."""
+    if len(blob) % 4:
+        raise DecodeError(f"coverage: {len(blob)} B is not a multiple of 4")
+    counts = np.frombuffer(blob, "<u4").astype(np.int64)
+    if n_segments is not None and len(counts) != n_segments:
+        raise DecodeError(
+            f"coverage: {len(counts)} counts for {n_segments} segments "
+            "(the archive was rescanned; refetch segments)"
+        )
+    return counts
+
+
+def decode_tile(blob, tile):
+    """One fp16 tile -> (tile, tile) float32 array."""
+    if len(blob) != tile * tile * 2:
+        raise DecodeError(f"tile: {len(blob)} B, expected {tile * tile * 2}")
+    return np.frombuffer(blob, "<f2").reshape(tile, tile).astype(np.float32)
+
+
+def decode_tiles(blob, tile):
+    """/tiles batch -> (epoch or None, {(x, y): (tile, tile) float32})."""
+    if len(blob) < _TILES_HEADER.size:
+        raise DecodeError(f"tiles: {len(blob)} B is shorter than the header")
+    epoch, count = _TILES_HEADER.unpack_from(blob, 0)
+    tile_bytes = tile * tile * 2
+    expected = _TILES_HEADER.size + count * (_XY.size + tile_bytes)
+    if len(blob) != expected:
+        raise DecodeError(
+            f"tiles: {len(blob)} B for {count} tiles, expected {expected}"
+        )
+    tiles = {}
+    off = _TILES_HEADER.size
+    for _ in range(count):
+        x, y = _XY.unpack_from(blob, off)
+        off += _XY.size
+        tiles[(x, y)] = (
+            np.frombuffer(blob, "<f2", tile * tile, off)
+            .reshape(tile, tile)
+            .astype(np.float32)
+        )
+        off += tile_bytes
+    return (None if np.isnan(epoch) else float(epoch)), tiles
+
+
+def encode_tiles(epoch, tiles):
+    """Inverse of :func:`decode_tiles` ({(x, y): array} -> bytes); used to
+    build test fixtures."""
+    parts = [_TILES_HEADER.pack(float("nan") if epoch is None else epoch, len(tiles))]
+    for (x, y), arr in tiles.items():
+        parts.append(_XY.pack(x, y))
+        parts.append(np.ascontiguousarray(arr, dtype="<f2").tobytes())
+    return b"".join(parts)
