@@ -1,6 +1,7 @@
 """HTTP client for the Argus data explorer tile server."""
 
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
@@ -9,6 +10,7 @@ import numpy as np
 from . import __version__, sky, times, wire
 from .errors import (
     BadRequest,
+    DecodeError,
     HTTPError,
     NoData,
     NotFound,
@@ -44,7 +46,10 @@ class Client:
     ``"rho"``), a :class:`Band`, or None for every camera.
 
     The client holds one connection pool; use it as a context manager or
-    call :meth:`close`. It is safe to share between threads.
+    call :meth:`close`. It is safe to share between threads. A request that
+    fails to connect, drops mid-response or meets a 502/503/504 from a web
+    edge is retried up to ``retries`` times, waiting ``backoff`` seconds and
+    doubling; every request is a read, so a retry is always safe.
     """
 
     def __init__(
@@ -56,6 +61,8 @@ class Client:
         max_workers=4,
         transport=None,
         verify=True,
+        retries=3,
+        backoff=0.5,
     ):
         hdrs = {"User-Agent": f"argex/{__version__}"}
         hdrs.update(headers or {})
@@ -68,6 +75,8 @@ class Client:
             follow_redirects=True,
         )
         self.max_workers = max_workers
+        self.retries = max(0, int(retries))
+        self.backoff = float(backoff)
         self._meta = None
         self._segments = None
 
@@ -89,14 +98,34 @@ class Client:
     def __repr__(self):
         return f"Client({self.base_url!r})"
 
+    _RETRY_STATUS = frozenset({502, 503, 504})
+
+    def _attempts(self):
+        """Delays before each attempt: 0, then backoff doubling."""
+        yield 0.0
+        for k in range(self.retries):
+            yield self.backoff * (2**k)
+
     def _get(self, path, **params):
         params = {k: v for k, v in params.items() if v is not None}
-        try:
-            response = self._http.get(path, params=params)
-        except httpx.TransportError as exc:
-            raise TransportError(f"{type(exc).__name__} for {path}: {exc}") from exc
-        if response.is_success:
-            return response
+        failure = None
+        for delay in self._attempts():
+            time.sleep(delay)
+            try:
+                response = self._http.get(path, params=params)
+            except httpx.TransportError as exc:
+                failure = TransportError(f"{type(exc).__name__} for {path}: {exc}")
+                continue
+            if response.status_code in self._RETRY_STATUS:
+                failure = self._http_error(response)
+                continue
+            if response.is_success:
+                return response
+            raise self._http_error(response)
+        raise failure
+
+    @staticmethod
+    def _http_error(response):
         status, body = response.status_code, response.text.strip()[:300]
         cls = (
             BadRequest
@@ -107,7 +136,7 @@ class Client:
             if status >= 500
             else HTTPError
         )
-        raise cls(status, response.url, body)
+        return cls(status, response.url, body)
 
     def _json(self, path, **params):
         return self._get(path, **params).json()
@@ -494,8 +523,10 @@ class Client:
         max_frames=500,
         mask=None,
     ):
-        """One plane per frame of the segment in [t1, t2], each fetched by
-        its frame key, ``max_workers`` requests in flight. With ``band=None``
+        """One plane per frame of the segment in [t1, t2]. From a server
+        offering ``/stack`` the planes arrive cropped, in one streamed
+        response per few thousand frames; otherwise each is fetched by its
+        frame key as tiles, ``max_workers`` requests in flight. With ``band=None``
         every camera's frames are included, interleaved by epoch; each
         plane's :class:`FrameInfo` names its camera and band. Raises
         ValueError when the window holds more than ``max_frames`` frames.
@@ -509,6 +540,17 @@ class Client:
         if len(listing) > max_frames:
             raise ValueError(
                 f"{len(listing)} frames in the window, over max_frames={max_frames}"
+            )
+        if not fill and "stack" in self.meta().raw.get("features", ()):
+            self._window_tiles(x0, y0, nx, ny)  # the window must meet the segment
+            lo, hi = self._window(t1, t2)
+            frames, planes = self._stream_stack(seg, x0, y0, nx, ny, lo, hi, name)
+            if mask is not None:
+                for plane in planes:
+                    plane[~mask] = np.nan
+            data = np.stack(planes) if planes else np.empty((0, ny, nx), np.float32)
+            return CutoutStack(
+                int(seg), x0, y0, data, tuple(frames), self.provenance(), mask
             )
         xy = self._window_tiles(x0, y0, nx, ny)
         zmax = self.meta().zmax
@@ -547,6 +589,67 @@ class Client:
             self.provenance(),
             mask,
         )
+
+    def _stream_stack(self, seg, x0, y0, nx, ny, lo, hi, band):
+        """(frames, planes) of every frame in [lo, hi] from the server's
+        /stack stream, following its pages. A stream that drops is resumed
+        from the last frame received (frames already in hand are not
+        repeated), within the client's retry budget."""
+        frames, planes, seen = [], [], set()
+        t1, attempts = lo, self._attempts()
+        while True:
+            end = None
+            try:
+                for head, pixels in self._stack_records(
+                    seg, x0, y0, nx, ny, t1, hi, band
+                ):
+                    if head["kind"] == "frame":
+                        frame = FrameInfo.from_json(head)
+                        ident = (frame.frame_key, frame.epoch)
+                        if ident not in seen:
+                            seen.add(ident)
+                            frames.append(frame)
+                            planes.append(pixels)
+                    elif head["kind"] == "end":
+                        end = head
+                if end is None:
+                    raise DecodeError(
+                        f"stack/{seg}: stream ended without its end record"
+                    )
+            except (TransportError, DecodeError, ServerError) as exc:
+                if (
+                    isinstance(exc, ServerError)
+                    and exc.status not in self._RETRY_STATUS
+                ):
+                    raise
+                delay = next(attempts, None)
+                if delay is None:
+                    raise exc from None
+                time.sleep(delay)
+                # resume at the last epoch received: frames sharing it may
+                # repeat, and `seen` drops them
+                t1 = frames[-1].epoch if frames else t1
+                continue
+            attempts = self._attempts()
+            next(attempts)
+            if not end.get("truncated") or end.get("next_t1") is None:
+                return frames, planes
+            t1 = float(end["next_t1"])
+
+    def _stack_records(self, seg, x0, y0, nx, ny, t1, t2, band):
+        """The decoded records of one /stack request, as they arrive."""
+        path = f"stack/{int(seg)}"
+        params = {"x0": x0, "y0": y0, "nx": nx, "ny": ny, "t1": t1, "t2": t2}
+        if band:
+            params["band"] = band
+        try:
+            with self._http.stream("GET", path, params=params) as response:
+                if not response.is_success:
+                    response.read()
+                    raise self._http_error(response)
+                yield from wire.iter_stack_records(response.iter_bytes())
+        except httpx.TransportError as exc:
+            raise TransportError(f"{type(exc).__name__} for {path}: {exc}") from None
 
     def stack_at(
         self,

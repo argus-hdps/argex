@@ -2,7 +2,9 @@
 through httpx.MockTransport. It mirrors the server's wire contract: /meta's
 epoch origin, cameras and provenance; /epochs sorted with frame keys and
 next_t1 paging under a small cap; frame identity on /nearest, /frame and
-the X-Frame-* headers of native tiles; key= and max_dt=; bare-ish 400s."""
+the X-Frame-* headers of native tiles; key= and max_dt=; bare-ish 400s.
+With stack=True it also advertises and serves the /stack stream, paged
+under stack_cap; drop_stack_after=n cuts the first stream after n frames."""
 
 import math
 
@@ -85,8 +87,18 @@ def frame_key(epoch, config):
 
 
 class FakeServer:
-    def __init__(self, epochs_cap=5, prefix="", meta_overrides=None):
+    def __init__(
+        self,
+        epochs_cap=5,
+        prefix="",
+        meta_overrides=None,
+        stack=False,
+        stack_cap=4,
+        drop_stack_after=None,
+    ):
         self.frames = _frames()
+        self.stack_cap = stack_cap
+        self.drop_stack_after = drop_stack_after
         self.epochs_cap = epochs_cap
         self.prefix = prefix
         self.requests = []
@@ -97,6 +109,8 @@ class FakeServer:
             epoch_min=min(all_eps),
             epoch_max=max(all_eps),
         )
+        if stack:
+            self.meta["features"] = ["stack"]
         self.meta.update(meta_overrides or {})
         self.bands = {b["name"]: set(b["configs"]) for b in META["bands"]}
 
@@ -218,6 +232,8 @@ class FakeServer:
             return httpx.Response(200, json=self.identity(seg, i, t))
         if parts[0] in ("tile", "tiles"):
             return self.tiles(parts, q)
+        if parts[0] == "stack" and "stack" in self.meta.get("features", ()):
+            return self.stack(parts, q)
         if path == "/transients":
             return httpx.Response(200, json={"events": [], "trails": []})
         if path == "/bogus":
@@ -332,6 +348,58 @@ class FakeServer:
         return httpx.Response(
             200, content=np.ascontiguousarray(arr, "<f2").tobytes(), headers=headers
         )
+
+
+def _stack_body(server, seg, rows, x0, y0, nx, ny, end):
+    """The /stack records of `rows` [(i, epoch, config)], cut short (a
+    dropped connection) after server.drop_stack_after frames, once."""
+    py, px = np.mgrid[y0 : y0 + ny, x0 : x0 + nx]
+    outside = (px < 0) | (px >= SIDE) | (py < 0) | (py >= SIDE)
+    frames = []
+    for i, _e, _c in rows:
+        pixels = pixel_value(i, px, py)
+        pixels[outside] = np.nan
+        frames.append((server.identity(seg, i), pixels))
+    body = wire.encode_stack(seg, x0, y0, nx, ny, frames, end)
+    drop, server.drop_stack_after = server.drop_stack_after, None
+    if drop is None:
+        yield body
+        return
+    # the stack record, `drop` frame records, then the connection fails
+    pos = 0
+    for _ in range(1 + drop):
+        (n,) = np.frombuffer(body, "<u4", 1, pos)
+        pos += 4 + int(n) + (0 if pos == 0 else nx * ny * 2)
+    yield body[:pos]
+    raise httpx.ReadError("connection reset")
+
+
+def _stack(self, parts, q):
+    seg = int(parts[1])
+    if seg not in self.frames:
+        raise _Status(404, "no such segment")
+    configs = self._band(q)
+    x0, y0, nx = int(q["x0"]), int(q["y0"]), int(q["nx"])
+    ny = int(q.get("ny", nx))
+    t1, t2 = self._float(q, "t1", -1e18), self._float(q, "t2", 1e18)
+    t1q = math.floor(t1 * 256) / 256
+    rows = sorted(
+        ((i, e, c) for i, e, c in self._frames_of(seg, configs) if t1q <= e <= t2),
+        key=lambda r: (r[1], r[2]),
+    )
+    end = {"frames": len(rows), "truncated": False, "next_t1": None}
+    if len(rows) > self.stack_cap:
+        cut = self.stack_cap
+        while cut > 0 and rows[cut][1] == rows[cut - 1][1]:
+            cut -= 1
+        end = {"frames": cut, "truncated": True, "next_t1": rows[cut][1]}
+        rows = rows[:cut]
+    return httpx.Response(
+        200, content=_stack_body(self, seg, rows, x0, y0, nx, ny, end)
+    )
+
+
+FakeServer.stack = _stack
 
 
 class _Status(Exception):

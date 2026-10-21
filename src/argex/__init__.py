@@ -6,7 +6,7 @@
 ...     cut.writeto("cut.fits")
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from . import sky, times, wire  # noqa: E402
 from .client import Client  # noqa: E402

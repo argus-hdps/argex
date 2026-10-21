@@ -1,5 +1,7 @@
 """Client against the in-process fake server (conftest.FakeServer)."""
 
+import math
+
 import httpx
 import numpy as np
 import pytest
@@ -264,7 +266,7 @@ def test_server_and_transport_errors():
     def boom(request):
         return httpx.Response(502, text="Bad Gateway")
 
-    with argex.Client("http://x/", transport=httpx.MockTransport(boom)) as c:
+    with argex.Client("http://x/", transport=httpx.MockTransport(boom), backoff=0) as c:
         with pytest.raises(argex.ServerError) as info:
             c.meta()
     assert info.value.status == 502 and isinstance(info.value, argex.HTTPError)
@@ -272,7 +274,7 @@ def test_server_and_transport_errors():
     def down(request):
         raise httpx.ConnectError("refused", request=request)
 
-    with argex.Client("http://x/", transport=httpx.MockTransport(down)) as c:
+    with argex.Client("http://x/", transport=httpx.MockTransport(down), backoff=0) as c:
         with pytest.raises(argex.TransportError):
             c.meta()
 
@@ -284,3 +286,86 @@ def test_prefixed_base_url(base):
         assert c.meta().version == "abcd1234"
         assert c.tiles(SEG_A, 0).tiles
     assert all(r.url.path.startswith("/explorer/") for r in server.requests)
+
+
+def test_transient_failures_are_retried():
+    calls = []
+
+    def flaky(request):
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ConnectError("TLS handshake EOF", request=request)
+        if len(calls) == 2:
+            return httpx.Response(503, text="unavailable")
+        return FakeServer()(request)
+
+    with argex.Client(
+        "http://fake/", transport=httpx.MockTransport(flaky), backoff=0
+    ) as c:
+        assert c.meta().version == "abcd1234"
+    assert len(calls) == 3
+
+    with argex.Client(
+        "http://x/", transport=httpx.MockTransport(flaky), retries=0, backoff=0
+    ) as c:
+        calls.clear()
+        with pytest.raises(argex.TransportError) as info:
+            c.meta()
+    assert info.value.__cause__ is None and "TLS handshake EOF" in str(info.value)
+
+
+def _stack_client(**kw):
+    server = FakeServer(stack=True, **kw)
+    return server, argex.Client(
+        "http://fake/", transport=httpx.MockTransport(server), backoff=0
+    )
+
+
+@pytest.mark.parametrize("band", [None, "rho"])
+def test_stack_stream_matches_tiles(client, band):
+    server, c = _stack_client()
+    with c:
+        streamed = c.stack(SEG_A, 250, -3, 12, 9, t1=_ep(0), t2=_ep(5), band=band)
+    by_tiles = client.stack(SEG_A, 250, -3, 12, 9, t1=_ep(0), t2=_ep(5), band=band)
+    assert streamed.frames == by_tiles.frames
+    assert np.array_equal(streamed.data, by_tiles.data, equal_nan=True)
+    assert np.isnan(streamed.data[:, :3]).all()  # overhang above row 0
+    paths = [r.url.path for r in server.requests]
+    assert not any(p.startswith("/tiles") for p in paths)
+    # the 4-frame stack cap pages without repeating or splitting an epoch
+    n_pages = sum(p.startswith("/stack") for p in paths)
+    assert n_pages == math.ceil(len(streamed) / 4)
+
+
+def test_stack_stream_resumes_after_a_drop():
+    server, c = _stack_client(stack_cap=100, drop_stack_after=3)
+    with c:
+        stack = c.stack(SEG_A, 100, 100, 8, t1=_ep(0), t2=_ep(5))
+    assert len(stack) == 12
+    assert [f.frame_key for f in stack.frames] == sorted(
+        (f.frame_key for f in stack.frames), key=lambda k: (k & (2**40 - 1), k >> 40)
+    )
+    assert len({f.frame_key for f in stack.frames}) == 12
+    stack_calls = [r for r in server.requests if r.url.path.startswith("/stack")]
+    assert len(stack_calls) == 2
+    # the retry resumes at the last epoch received, not the window start
+    assert float(stack_calls[1].url.params["t1"]) == stack.frames[2].epoch
+
+
+def test_stack_with_fill_uses_tiles():
+    server, c = _stack_client()
+    with c:
+        c.stack(SEG_A, 100, 100, 8, t1=_ep(0), t2=_ep(1), band="rho", fill=True)
+    assert not any(r.url.path.startswith("/stack") for r in server.requests)
+
+
+def test_stack_stream_mask_and_bad_window():
+    _server, c = _stack_client()
+    mask = np.zeros((8, 8), bool)
+    mask[2:4, 2:4] = True
+    with c:
+        stack = c.stack(SEG_A, 100, 100, 8, t1=_ep(0), t2=_ep(0), mask=mask)
+        assert np.isnan(stack.data[:, ~mask]).all()
+        assert not np.isnan(stack.data[:, mask]).any()
+        with pytest.raises(ValueError, match="misses the segment"):
+            c.stack(SEG_A, 5000, 0, 8, t1=_ep(0), t2=_ep(0))

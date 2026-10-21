@@ -79,7 +79,7 @@ client returns float32.
 
 | Method | Returns |
 | --- | --- |
-| `Client(base_url, *, timeout=30, headers=None, max_workers=4, transport=None, verify=True)` | context manager, thread-safe |
+| `Client(base_url, *, timeout=30, headers=None, max_workers=4, transport=None, verify=True, retries=3, backoff=0.5)` | context manager, thread-safe |
 | `meta(refresh=False)`, `provenance()` | `Meta`, `Provenance` |
 | `bands`, `band(name)` | `tuple[Band]`, `Band` |
 | `segments(refresh=False)` | `SegmentTable` |
@@ -109,9 +109,17 @@ iteration over `Cutout`s, `select(band=, telescope_config=)`,
 `light_curve(x, y, radius)` and a FITS writer: the cube plus a `FRAMES` table
 with one row per plane.
 
-`stack` fetches each frame by its key, one request per frame
-(`max_workers` at a time), and refuses windows holding more than
-`max_frames` frames; keep windows modest on the shared server.
+`stack` reads the server's `/stack` stream: every frame in the window,
+cropped server-side, in one response per few thousand frames, decoded as
+it arrives. Against a server without `/stack`, and with `fill=True`, it
+fetches each frame's tiles instead, one request per frame (`max_workers`
+at a time). It refuses windows holding more than `max_frames` frames.
+
+**Retries.** A request that fails to connect, drops mid-response, or gets
+a 502, 503 or 504 from a web edge is retried up to `retries` times,
+waiting `backoff` seconds and doubling. A dropped `/stack` stream resumes
+from the last frame received. Every request is a read, so retrying is
+safe.
 
 ## FITS keywords
 
