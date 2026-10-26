@@ -735,6 +735,56 @@ class MinipixSeries(CutoutStack):
             out |= self.dq_or[:, q]
         return out
 
+    def records(self, x=None, y=None, gr=None):
+        """The per-frame DQ and photocal records as an astropy Table, one
+        row per frame (in the series' order):
+
+        ``epoch`` (s), ``mjd`` (TT), ``utc``, ``band``, ``telescope_config``,
+        ``frame_key``; ``has_dq``, ``dq`` (the OR over all quadrants),
+        ``dq_names``, ``dq_or`` and ``n_flagged`` (4 quadrants each,
+        ``[SW, SE, NW, NE]``); ``has_photocal``, ``zp`` (aperture 1 at the
+        centre, for g - r = ``gr_pivot``), ``grad_x``, ``grad_y``, ``color``.
+        Given a cutout pixel (x, y), and optionally a color ``gr``, it adds
+        ``zp_at``: the zeropoint evaluated there (:meth:`zeropoint`)."""
+        from astropy.table import Table
+
+        epochs = self.epochs
+        flags = self.dq()
+        cols = {
+            "epoch": epochs,
+            "mjd": times.to_mjd(epochs) if len(self) else np.empty(0),
+            "utc": (np.atleast_1d(times.to_iso(epochs, "utc")) if len(self) else []),
+            "band": [f.band or "" for f in self.frames],
+            "telescope_config": [f.telescope_config for f in self.frames],
+            "frame_key": [
+                f.frame_key if f.frame_key is not None else -1 for f in self.frames
+            ],
+            "has_dq": self.has_dq,
+            "dq": flags,
+            "dq_names": [",".join(dqflags.names(v)) for v in flags],
+            "dq_or": self.dq_or,
+            "n_flagged": self.n_flagged,
+            "has_photocal": self.has_photocal,
+            "zp": self.zp[:, 0],
+            "grad_x": self.grad_x,
+            "grad_y": self.grad_y,
+            "color": self.color,
+        }
+        if x is not None and y is not None:
+            cols["zp_at"] = self.zeropoint(x, y, gr)
+        return Table(
+            cols,
+            meta={
+                "seg": self.seg,
+                "idx": self.idx,
+                "gr_pivot": self.gr_pivot,
+                "gradient_px": self.gradient_px,
+                "x": x,
+                "y": y,
+                "gr": gr,
+            },
+        )
+
     def photometry(
         self,
         x,

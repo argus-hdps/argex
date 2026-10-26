@@ -158,3 +158,20 @@ def test_fits_frames_table_carries_the_records(series, tmp_path):
         rows = table.data
         assert rows["DQ_OR"].shape == (24, 4) and rows["ZP"].shape == (24, 3)
         np.testing.assert_array_equal(rows["HAS_CAL"], series.has_photocal)
+
+
+def test_records_table(series):
+    rho = series.select(band="rho")
+    table = rho.records(*STAR_XY, gr=1.1)
+    assert len(table) == 12 and table.meta["idx"] == MINIPIX[1]
+    assert list(table["frame_key"]) == [f.frame_key for f in rho.frames]
+    assert table["dq"][CR_FRAME] == argex.dq.Flags.COSMIC_RAY
+    assert table["dq_names"][CR_FRAME] == "COSMIC_RAY" and table["dq_names"][0] == ""
+    assert table["n_flagged"][CR_FRAME].tolist() == [0, 0, 3, 0]
+    assert not table["has_photocal"][UNCALIBRATED] and np.isnan(
+        table["zp"][UNCALIBRATED]
+    )
+    assert table["zp"][0] == star_zp(0)
+    np.testing.assert_allclose(table["zp_at"], rho.zeropoint(*STAR_XY, 1.1))
+    assert table["utc"][0].startswith("2026-")
+    assert "zp_at" not in rho.records().colnames
