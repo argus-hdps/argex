@@ -6,9 +6,9 @@
 ...     cut.writeto("cut.fits")
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
-from . import sky, times, wire  # noqa: E402
+from . import dq, sky, times, wire  # noqa: E402
 from .client import Client  # noqa: E402
 from .errors import (  # noqa: E402
     BadRequest,
@@ -28,6 +28,7 @@ from .models import (  # noqa: E402
     FrameInfo,
     FrameList,
     Meta,
+    MinipixSeries,
     Provenance,
     SegmentTable,
     Tile,
@@ -46,6 +47,7 @@ __all__ = [
     "FrameList",
     "HTTPError",
     "Meta",
+    "MinipixSeries",
     "NoData",
     "NotFound",
     "Provenance",
@@ -55,6 +57,7 @@ __all__ = [
     "TileBatch",
     "TransportError",
     "UnknownBand",
+    "dq",
     "sky",
     "times",
     "wire",

@@ -98,11 +98,17 @@ def encode_tiles(epoch, tiles):
 _U32 = struct.Struct("<I")
 
 
+#: Head records of the framed streams: /stack opens with "stack",
+#: /minipix/series with "minipix"; both carry the frame shape and dtype.
+_HEAD_KINDS = ("stack", "minipix")
+
+
 def iter_stack_records(chunks):
-    """Decode a /stack body as it arrives: ``chunks`` is an iterable of
-    bytes, and each complete record is yielded as (head, pixels) with
-    pixels an (ny, nx) float32 array for a "frame" record, else None.
-    Raises DecodeError on a malformed record or a record cut short."""
+    """Decode a /stack or /minipix/series body as it arrives: ``chunks`` is
+    an iterable of bytes, and each complete record is yielded as
+    (head, pixels) with pixels an (ny, nx) float32 array for a "frame"
+    record, else None. Raises DecodeError on a malformed record or a record
+    cut short."""
     buf = bytearray()
     shape = None
     for chunk in chunks:
@@ -120,13 +126,13 @@ def iter_stack_records(chunks):
             except (ValueError, KeyError, TypeError) as exc:
                 raise DecodeError(f"stack: malformed record ({exc})") from None
             size = 0
-            if kind == "stack":
+            if kind in _HEAD_KINDS:
                 if head.get("dtype") != "<f2":
                     raise DecodeError(f"stack: unsupported dtype {head.get('dtype')!r}")
                 shape = (int(head["ny"]), int(head["nx"]))
             elif kind == "frame":
                 if shape is None:
-                    raise DecodeError("stack: frame record before the stack record")
+                    raise DecodeError("stack: frame record before the head record")
                 size = shape[0] * shape[1] * 2
             if len(buf) - pos - 4 - n < size:
                 break
@@ -155,6 +161,24 @@ def encode_stack(seg, x0, y0, nx, ny, frames, end):
 
     head = {"kind": "stack", "seg": seg, "x0": x0, "y0": y0, "nx": nx, "ny": ny}
     parts = [record({**head, "dtype": "<f2", "frames": len(frames)})]
+    for ident, pixels in frames:
+        parts.append(
+            record({**ident, "kind": "frame"}, np.asarray(pixels, "<f2").tobytes())
+        )
+    parts.append(record({"kind": "end", **end}))
+    return b"".join(parts)
+
+
+def encode_minipix_series(head, frames, end):
+    """A /minipix/series body from its head fields (seg, idx, x0, y0, nx, ny
+    and the photocal conventions), a list of (identity dict with "dq" and
+    "photocal", pixels) and an end record; used to build test fixtures."""
+
+    def record(h, payload=b""):
+        body = json.dumps(h).encode()
+        return _U32.pack(len(body)) + body + payload
+
+    parts = [record({"kind": "minipix", **head, "dtype": "<f2", "frames": len(frames)})]
     for ident, pixels in frames:
         parts.append(
             record({**ident, "kind": "frame"}, np.asarray(pixels, "<f2").tobytes())
