@@ -101,6 +101,8 @@ client returns float32.
 | `stack_at(ra, dec, size=32, ...)`, `minipix_stack(seg, idxs, ...)` | `CutoutStack` |
 | `transients()`, `bogus(t1, t2, segs)` | catalog dicts (empty until the transients DB backs them) |
 | `minipix_active(segs, t, window=60)`, `minipix_schedule(seg, idx)` | `{seg: [idx]}`, `[(start, end)]` |
+| `minipix_series(seg, idx, t1=None, t2=None, *, band)` | `MinipixSeries` |
+| `minipix_series_at(ra, dec, t1=None, t2=None, *, band)` | `(MinipixSeries, x, y)` |
 
 `Cutout` carries `seg`, `x0`, `y0`, `data`, `frame`, `provenance`, `mask`
 and offers `wcs`, `time`, `header()`, `to_hdu()`, `writeto()`,
@@ -108,6 +110,29 @@ and offers `wcs`, `time`, `header()`, `to_hdu()`, `writeto()`,
 iteration over `Cutout`s, `select(band=, telescope_config=)`,
 `light_curve(x, y, radius)` and a FITS writer: the cube plus a `FRAMES` table
 with one row per plane.
+
+**Minipix series.** An active minipix keeps a 32 x 32 cutout of every frame
+that covers it, in its own store beside the segments, with two per-frame
+records: data quality and photometric calibration. `minipix_series` reads
+them from the server's `/minipix/series` stream as a `MinipixSeries`, a
+`CutoutStack` (pixels in e-/s) with, per frame:
+
+- `dq_or[k, q]`, `n_flagged[k, q]`, `has_dq[k]`: the OR of the
+  data-quality flags (`argex.dq.Flags`) and the flagged-pixel count in each
+  16 x 16 quadrant `q` (`[SW, SE, NW, NE]`);
+- `zp[k, a]`, `grad_x[k]`, `grad_y[k]`, `color[k]`, `has_photocal[k]`: the
+  zeropoint at the cutout centre for fluxes in e-/s at g - r = `gr_pivot`
+  (0.6), its change across `gradient_px` (32) pixels in x and y, and its
+  change per mag of g - r; NaN where the frame was not calibrated.
+
+`zeropoint(x, y, gr)` evaluates that model at a cutout pixel for a source
+of color g - r; `dq(x, y, radius)` ORs the flags of the quadrants an
+aperture touches; `records(x, y, gr)` lists both records per frame as an
+astropy Table. Measuring fluxes is left to standard tools such as
+photutils. The FITS writer adds the records to the `FRAMES` table, and
+`argex.read(path)` reads any cutout, stack or minipix-series file back as
+the same object, records included. `minipix_stack` is different: it cuts
+the same window out of the archived segment frames.
 
 `stack` reads the server's `/stack` stream: every frame in the window,
 cropped server-side, in one response per few thousand frames, decoded as
@@ -117,8 +142,8 @@ at a time). It refuses windows holding more than `max_frames` frames.
 
 **Retries.** A request that fails to connect, drops mid-response, or gets
 a 502, 503 or 504 from a web edge is retried up to `retries` times,
-waiting `backoff` seconds and doubling. A dropped `/stack` stream resumes
-from the last frame received. Every request is a read, so retrying is
+waiting `backoff` seconds and doubling. A dropped `/stack` or
+`/minipix/series` stream resumes from the last frame received. Every request is a read, so retrying is
 safe.
 
 ## FITS keywords

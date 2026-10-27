@@ -4,7 +4,9 @@ epoch origin, cameras and provenance; /epochs sorted with frame keys and
 next_t1 paging under a small cap; frame identity on /nearest, /frame and
 the X-Frame-* headers of native tiles; key= and max_dt=; bare-ish 400s.
 With stack=True it also advertises and serves the /stack stream, paged
-under stack_cap; drop_stack_after=n cuts the first stream after n frames."""
+under stack_cap; drop_stack_after=n cuts the first stream after n frames.
+With minipix=True it advertises /minipix/series and serves it for one
+minipix (MINIPIX = (seg, idx)), paged and cut the same way."""
 
 import math
 
@@ -95,6 +97,8 @@ class FakeServer:
         stack=False,
         stack_cap=4,
         drop_stack_after=None,
+        minipix=False,
+        minipix_at=None,
     ):
         self.frames = _frames()
         self.stack_cap = stack_cap
@@ -109,8 +113,12 @@ class FakeServer:
             epoch_min=min(all_eps),
             epoch_max=max(all_eps),
         )
-        if stack:
-            self.meta["features"] = ["stack"]
+        features = (["stack"] if stack else []) + (
+            ["minipix_series"] if minipix else []
+        )
+        if features:
+            self.meta["features"] = features
+        self.minipix = minipix_at or MINIPIX
         self.meta.update(meta_overrides or {})
         self.bands = {b["name"]: set(b["configs"]) for b in META["bands"]}
 
@@ -234,6 +242,10 @@ class FakeServer:
             return self.tiles(parts, q)
         if parts[0] == "stack" and "stack" in self.meta.get("features", ()):
             return self.stack(parts, q)
+        if parts[:2] == ["minipix", "series"] and "minipix_series" in self.meta.get(
+            "features", ()
+        ):
+            return self.minipix_series(parts, q)
         if path == "/transients":
             return httpx.Response(200, json={"events": [], "trails": []})
         if path == "/bogus":
@@ -400,6 +412,101 @@ def _stack(self, parts, q):
 
 
 FakeServer.stack = _stack
+
+# The served minipix: segment SEG_A, minipix (ix, iy) = (5, 7).
+MINIPIX = (SEG_A, 7 * 64 + 5)
+STAR_XY = (15.3, 16.6)  # cutout pixel of the synthetic star
+STAR_SIGMA = 1.4
+BKG = 2.0  # e-/s per pixel
+CR_FRAME = 2  # frame index with a cosmic ray flagged under the star
+UNCALIBRATED = 3  # frame index without a photocal record
+
+
+def star_flux(i):
+    """The synthetic star's flux (e-/s) in frame i."""
+    return 1500.0 * (1.0 + 0.2 * math.sin(i))
+
+
+def star_zp(i):
+    return 20.25 + 0.01 * i
+
+
+def minipix_frame(seg, i, epoch, config, server):
+    """(identity with dq and photocal, pixels) of the served minipix in
+    frame i."""
+    yy, xx = np.mgrid[:32, :32]
+    d2 = (xx - STAR_XY[0]) ** 2 + (yy - STAR_XY[1]) ** 2
+    psf = np.exp(-d2 / (2 * STAR_SIGMA**2)) / (2 * math.pi * STAR_SIGMA**2)
+    pixels = BKG + star_flux(i) * psf
+    ident = dict(server.identity(seg, i))
+    ident["idx"] = server.minipix[1]
+    ident["data_file"] = f"2026_3/266/seg_{seg:09d}/minipix_{server.minipix[1]:04d}.arg"
+    ident["dq"] = {
+        # the cosmic ray is in the NW quadrant, under the star
+        "dq_or": [0, 0, 1 << 15, 0] if i == CR_FRAME else [0, 0, 0, 0],
+        "n_flagged": [0, 0, 3, 0] if i == CR_FRAME else [0, 0, 0, 0],
+    }
+    ident["photocal"] = (
+        None
+        if i == UNCALIBRATED
+        else {
+            "zp": [star_zp(i), None, None],
+            "grad_x": 0.001,
+            "grad_y": -0.002,
+            "color": 0.05,
+        }
+    )
+    return ident, pixels
+
+
+def _minipix_series(self, parts, q):
+    seg, idx = int(parts[2]), int(parts[3])
+    if (seg, idx) != self.minipix:
+        raise _Status(404, "no cutouts for this minipix")
+    configs = self._band(q)
+    t1, t2 = self._float(q, "t1", -1e18), self._float(q, "t2", 1e18)
+    t1q = math.floor(t1 * 256) / 256
+    rows = sorted(
+        ((i, e, c) for i, e, c in self._frames_of(seg, configs) if t1q <= e <= t2),
+        key=lambda r: (r[1], r[2]),
+    )
+    end = {"frames": len(rows), "truncated": False, "next_t1": None}
+    if len(rows) > self.stack_cap:
+        cut = self.stack_cap
+        while cut > 0 and rows[cut][1] == rows[cut - 1][1]:
+            cut -= 1
+        end = {"frames": cut, "truncated": True, "next_t1": rows[cut][1]}
+        rows = rows[:cut]
+    grid = 64
+    head = {
+        "seg": seg,
+        "idx": idx,
+        "x0": (idx % grid) * 32,
+        "y0": (idx // grid) * 32,
+        "nx": 32,
+        "ny": 32,
+        "zp_flux_unit": "e-/s",
+        "gr_pivot": 0.6,
+        "gradient_px": 32,
+    }
+    frames = [minipix_frame(seg, i, e, c, self) for i, e, c in rows]
+    body = wire.encode_minipix_series(head, frames, end)
+    drop, self.drop_stack_after = self.drop_stack_after, None
+    if drop is None:
+        return httpx.Response(200, content=body)
+
+    def dropped():
+        pos = 0
+        for _ in range(1 + drop):
+            (n,) = np.frombuffer(body, "<u4", 1, pos)
+            pos += 4 + int(n) + (0 if pos == 0 else 32 * 32 * 2)
+        yield body[:pos]
+        raise httpx.ReadError("connection reset")
+
+    return httpx.Response(200, content=dropped())
+
+
+FakeServer.minipix_series = _minipix_series
 
 
 class _Status(Exception):

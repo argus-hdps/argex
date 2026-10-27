@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import numpy as np
 from astropy.io import fits
 
+from . import dq as dqflags
 from . import sky, times
 
 
@@ -468,6 +469,17 @@ class CutoutStack:
     def wcs(self):
         return sky.wcs(self.seg, self.x0, self.y0, self.data.shape[1:])
 
+    def pixel_to_radec(self, x, y):
+        """Window pixel (0-indexed, data[k, y, x]) -> (ra, dec)."""
+        return sky.pixel_to_radec(
+            self.seg, np.asarray(x) + self.x0, np.asarray(y) + self.y0
+        )
+
+    def radec_to_pixel(self, ra, dec):
+        """(ra, dec) -> float window pixel (x, y)."""
+        px, py = sky.radec_to_pixel(self.seg, ra, dec)
+        return px - self.x0, py - self.y0
+
     def select(self, band=None, telescope_config=None):
         """The planes of one band or camera code, as a new stack."""
         keep = [
@@ -577,6 +589,223 @@ class CutoutStack:
         self.to_hdulist().writeto(path, overwrite=overwrite)
 
 
+@dataclass(frozen=True, eq=False)
+class MinipixSeries(CutoutStack):
+    """One archived minipix over time: the 32 x 32 cutouts the pipeline kept
+    for it, one plane per frame, with each frame's data-quality and
+    photometric-calibration records.
+
+    Pixels are e-/s. Per frame ``k``:
+
+    - ``dq_or[k, q]``, ``n_flagged[k, q]``: the OR of the data-quality flags
+      (:class:`argex.dq.Flags`) and the flagged-pixel count in quadrant
+      ``q`` (``[SW, SE, NW, NE]``); ``has_dq[k]`` is False when the frame
+      has no record.
+    - ``zp[k, a]``: the zeropoint of aperture ``a`` at the minipix centre,
+      for fluxes in e-/s at g - r = ``gr_pivot``; ``grad_x[k]``,
+      ``grad_y[k]``: its change across ``gradient_px`` pixels along x and
+      y; ``color[k]``: its change per mag of g - r. NaN where the record is
+      null or the frame has none (``has_photocal[k]`` False): the frame was
+      not calibrated, or the minipix centre was off it.
+
+    A calibrated magnitude is ``zeropoint(x, y, gr) - 2.5 log10(flux)``,
+    with the flux measured as the pipeline measured the calibrators it was
+    fitted to."""
+
+    idx: int = -1
+    dq_or: np.ndarray | None = None  # (n, 4) uint32
+    n_flagged: np.ndarray | None = None  # (n, 4) uint16
+    has_dq: np.ndarray | None = None  # (n,) bool
+    zp: np.ndarray | None = None  # (n, 3) float64
+    grad_x: np.ndarray | None = None  # (n,) float64
+    grad_y: np.ndarray | None = None
+    color: np.ndarray | None = None
+    has_photocal: np.ndarray | None = None  # (n,) bool
+    gr_pivot: float = 0.6
+    gradient_px: int = 32
+
+    @classmethod
+    def from_records(cls, head, frames, planes, provenance):
+        """From the decoded /minipix/series records: the head record, the
+        frame records and their pixel planes."""
+        n = len(frames)
+        ny, nx = int(head["ny"]), int(head["nx"])
+        dq_or = np.zeros((n, 4), np.uint32)
+        n_flagged = np.zeros((n, 4), np.uint16)
+        has_dq = np.zeros(n, bool)
+        zp = np.full((n, 3), np.nan)
+        grads = np.full((3, n), np.nan)
+        has_cal = np.zeros(n, bool)
+        for k, f in enumerate(frames):
+            if f.get("dq") is not None:
+                has_dq[k] = True
+                dq_or[k] = f["dq"]["dq_or"]
+                n_flagged[k] = f["dq"]["n_flagged"]
+            cal = f.get("photocal")
+            if cal is not None:
+                has_cal[k] = True
+                zp[k] = [np.nan if z is None else z for z in cal["zp"]]
+                for row, name in enumerate(("grad_x", "grad_y", "color")):
+                    if cal[name] is not None:
+                        grads[row, k] = cal[name]
+        return cls(
+            seg=int(head["seg"]),
+            x0=int(head["x0"]),
+            y0=int(head["y0"]),
+            data=(np.stack(planes) if planes else np.empty((0, ny, nx), np.float32)),
+            frames=tuple(FrameInfo.from_json(f) for f in frames),
+            provenance=provenance,
+            idx=int(head["idx"]),
+            dq_or=dq_or,
+            n_flagged=n_flagged,
+            has_dq=has_dq,
+            zp=zp,
+            grad_x=grads[0],
+            grad_y=grads[1],
+            color=grads[2],
+            has_photocal=has_cal,
+            gr_pivot=float(head.get("gr_pivot", 0.6)),
+            gradient_px=int(head.get("gradient_px", nx)),
+        )
+
+    def _take(self, keep):
+        keep = np.asarray(keep, dtype=int)
+        return MinipixSeries(
+            self.seg,
+            self.x0,
+            self.y0,
+            self.data[keep],
+            tuple(self.frames[k] for k in keep),
+            self.provenance,
+            self.mask,
+            idx=self.idx,
+            dq_or=self.dq_or[keep],
+            n_flagged=self.n_flagged[keep],
+            has_dq=self.has_dq[keep],
+            zp=self.zp[keep],
+            grad_x=self.grad_x[keep],
+            grad_y=self.grad_y[keep],
+            color=self.color[keep],
+            has_photocal=self.has_photocal[keep],
+            gr_pivot=self.gr_pivot,
+            gradient_px=self.gradient_px,
+        )
+
+    def select(self, band=None, telescope_config=None):
+        """The frames of one band or camera code, as a new series."""
+        return self._take(
+            [
+                k
+                for k, f in enumerate(self.frames)
+                if (band is None or f.band == band)
+                and (telescope_config is None or f.telescope_config == telescope_config)
+            ]
+        )
+
+    @property
+    def center(self):
+        """The cutout pixel (x, y) the zeropoint is quoted at."""
+        ny, nx = self.data.shape[1:]
+        return (nx - 1) / 2.0, (ny - 1) / 2.0
+
+    def zeropoint(self, x=None, y=None, gr=None, aperture=0):
+        """Each frame's zeropoint (n,) at cutout pixel (x, y) (default: the
+        centre) for a source of color ``gr`` (g - r, mag; default: the
+        pivot), from the records' first-order model. NaN for frames without
+        a calibration."""
+        cx, cy = self.center
+        x = cx if x is None else x
+        y = cy if y is None else y
+        out = (
+            self.zp[:, aperture]
+            + self.grad_x * (x - cx) / self.gradient_px
+            + self.grad_y * (y - cy) / self.gradient_px
+        )
+        if gr is not None:
+            out = out + self.color * (gr - self.gr_pivot)
+        return out
+
+    def dq(self, x=None, y=None, radius=None):
+        """Each frame's DQ flags (n,) uint32: the OR over the quadrants a
+        circle of ``radius`` at cutout pixel (x, y) touches, or over the
+        whole cutout without one. Frames without a record give 0; see
+        ``has_dq``."""
+        qs = range(4) if radius is None else dqflags.quadrants(x, y, radius)
+        out = np.zeros(len(self), np.uint32)
+        for q in qs:
+            out |= self.dq_or[:, q]
+        return out
+
+    def records(self, x=None, y=None, gr=None):
+        """The per-frame DQ and photocal records as an astropy Table, one
+        row per frame (in the series' order):
+
+        ``epoch`` (s), ``mjd`` (TT), ``utc``, ``band``, ``telescope_config``,
+        ``frame_key``; ``has_dq``, ``dq`` (the OR over all quadrants),
+        ``dq_names``, ``dq_or`` and ``n_flagged`` (4 quadrants each,
+        ``[SW, SE, NW, NE]``); ``has_photocal``, ``zp`` (aperture 1 at the
+        centre, for g - r = ``gr_pivot``), ``grad_x``, ``grad_y``, ``color``.
+        Given a cutout pixel (x, y), and optionally a color ``gr``, it adds
+        ``zp_at``: the zeropoint evaluated there (:meth:`zeropoint`)."""
+        from astropy.table import Table
+
+        epochs = self.epochs
+        flags = self.dq()
+        cols = {
+            "epoch": epochs,
+            "mjd": times.to_mjd(epochs) if len(self) else np.empty(0),
+            "utc": (np.atleast_1d(times.to_iso(epochs, "utc")) if len(self) else []),
+            "band": [f.band or "" for f in self.frames],
+            "telescope_config": [f.telescope_config for f in self.frames],
+            "frame_key": [
+                f.frame_key if f.frame_key is not None else -1 for f in self.frames
+            ],
+            "has_dq": self.has_dq,
+            "dq": flags,
+            "dq_names": [",".join(dqflags.names(v)) for v in flags],
+            "dq_or": self.dq_or,
+            "n_flagged": self.n_flagged,
+            "has_photocal": self.has_photocal,
+            "zp": self.zp[:, 0],
+            "grad_x": self.grad_x,
+            "grad_y": self.grad_y,
+            "color": self.color,
+        }
+        if x is not None and y is not None:
+            cols["zp_at"] = self.zeropoint(x, y, gr)
+        return Table(
+            cols,
+            meta={
+                "seg": self.seg,
+                "idx": self.idx,
+                "gr_pivot": self.gr_pivot,
+                "gradient_px": self.gradient_px,
+                "x": x,
+                "y": y,
+                "gr": gr,
+            },
+        )
+
+    def frames_table(self):
+        """The FRAMES table with each frame's DQ and photocal records."""
+        table = super().frames_table()
+        cols = list(table.columns) + [
+            fits.Column("HAS_DQ", "L", array=self.has_dq),
+            fits.Column("DQ_OR", "4J", array=self.dq_or.astype(np.int64)),
+            fits.Column("DQ_NFLAG", "4I", array=self.n_flagged.astype(np.int16)),
+            fits.Column("HAS_CAL", "L", array=self.has_photocal),
+            fits.Column("ZP", "3D", unit="mag", array=self.zp),
+            fits.Column("ZP_GRADX", "D", unit="mag", array=self.grad_x),
+            fits.Column("ZP_GRADY", "D", unit="mag", array=self.grad_y),
+            fits.Column("ZP_COLOR", "D", unit="mag/mag", array=self.color),
+        ]
+        out = fits.BinTableHDU.from_columns(cols, name="FRAMES", header=table.header)
+        out.header["MINIPIX"] = (self.idx, "minipix index in the segment")
+        out.header["GRPIVOT"] = (self.gr_pivot, "g - r at which ZP is quoted")
+        out.header["GRADPX"] = (self.gradient_px, "pixels per ZP_GRADX/Y step")
+        return out
+
+
 def _product_header(wcs, cards):
     """The WCS header (less its placeholder MJDREF) extended with cards."""
     header = wcs.to_header()
@@ -587,3 +816,83 @@ def _product_header(wcs, cards):
 
 def _opt_float(value):
     return None if value is None else float(value)
+
+
+def read(path):
+    """A :class:`Cutout`, :class:`CutoutStack` or :class:`MinipixSeries` from
+    a FITS file its ``writeto`` wrote (a path, URL or file object; the image
+    may be tile-compressed). The frame identities, records and processing
+    versions come back from the headers and the FRAMES table."""
+    with fits.open(path) as hdul:
+        image = next(h for h in hdul if h.is_image and h.data is not None)
+        header = image.header
+        data = np.asarray(image.data, np.float32)
+        provenance = Provenance(
+            header.get("PROCVER"), header.get("SRVPROC"), header.get("ARGEXVER", "")
+        )
+        seg = int(header["TANSEGID"])
+        x0, y0 = int(header["CUTORGX"]), int(header["CUTORGY"])
+        if "FRAMES" not in hdul:
+            return Cutout(seg, x0, y0, data, _frame_from_header(seg, header), provenance)
+        table = hdul["FRAMES"]
+        rows = table.data
+        frames = tuple(_frame_from_row(seg, r) for r in rows)
+        if "MINIPIX" not in table.header:
+            return CutoutStack(seg, x0, y0, data, frames, provenance)
+        return MinipixSeries(
+            seg,
+            x0,
+            y0,
+            data,
+            frames,
+            provenance,
+            idx=int(table.header["MINIPIX"]),
+            dq_or=np.asarray(rows["DQ_OR"], np.uint32).reshape(-1, 4),
+            n_flagged=np.asarray(rows["DQ_NFLAG"], np.uint16).reshape(-1, 4),
+            has_dq=np.asarray(rows["HAS_DQ"], bool),
+            zp=np.asarray(rows["ZP"], np.float64).reshape(-1, 3),
+            grad_x=np.asarray(rows["ZP_GRADX"], np.float64),
+            grad_y=np.asarray(rows["ZP_GRADY"], np.float64),
+            color=np.asarray(rows["ZP_COLOR"], np.float64),
+            has_photocal=np.asarray(rows["HAS_CAL"], bool),
+            gr_pivot=float(table.header["GRPIVOT"]),
+            gradient_px=int(table.header["GRADPX"]),
+        )
+
+
+def _frame_from_header(seg, h):
+    return FrameInfo(
+        seg=seg,
+        epoch=float(h["ARGEPOCH"]),
+        epoch_256=int(h["ARGE256"]),
+        telescope_config=int(h["TELCONF"]),
+        frame_key=h.get("FRAMEKEY"),
+        camera=h.get("CAMID"),
+        band=h.get("BAND"),
+        format=int(h["ARGFMT"]),
+        checksum=int(h["ARGCKSUM"]),
+        data_file=str(h["ARGFILE"]),
+        byte_offset=int(h["ARGOFFS"]),
+        clamped=bool(h.get("ARGCLAMP", False)),
+        fill=bool(h.get("ARGFILL", False)),
+        requested_t=_opt_float(h.get("ARGREQT")),
+        offset_s=_opt_float(h.get("ARGDT")),
+    )
+
+
+def _frame_from_row(seg, r):
+    key = int(r["FRAMEKEY"])
+    return FrameInfo(
+        seg=seg,
+        epoch=float(r["EPOCH"]),
+        epoch_256=int(r["EPOCH256"]),
+        telescope_config=int(r["TELCONF"]),
+        frame_key=None if key < 0 else key,
+        camera=str(r["CAMID"]).strip() or None,
+        band=str(r["BAND"]).strip() or None,
+        format=int(r["ARGFMT"]),
+        checksum=int(r["ARGCKSUM"]),
+        data_file=str(r["ARGFILE"]).strip(),
+        byte_offset=int(r["ARGOFFS"]),
+        fill=bool(r["FILLED"]),
+    )

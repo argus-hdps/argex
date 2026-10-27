@@ -11,6 +11,7 @@ from . import __version__, sky, times, wire
 from .errors import (
     BadRequest,
     DecodeError,
+    ExplorerError,
     HTTPError,
     NoData,
     NotFound,
@@ -25,6 +26,7 @@ from .models import (
     FrameInfo,
     FrameList,
     Meta,
+    MinipixSeries,
     Provenance,
     SegmentTable,
     Tile,
@@ -592,30 +594,36 @@ class Client:
 
     def _stream_stack(self, seg, x0, y0, nx, ny, lo, hi, band):
         """(frames, planes) of every frame in [lo, hi] from the server's
-        /stack stream, following its pages. A stream that drops is resumed
-        from the last frame received (frames already in hand are not
-        repeated), within the client's retry budget."""
-        frames, planes, seen = [], [], set()
+        /stack stream (see :meth:`_stream`)."""
+        params = {"x0": x0, "y0": y0, "nx": nx, "ny": ny}
+        _head, heads, planes = self._stream(f"stack/{int(seg)}", params, lo, hi, band)
+        return [FrameInfo.from_json(h) for h in heads], planes
+
+    def _stream(self, path, params, lo, hi, band):
+        """(head, frame records, planes) of every frame in [lo, hi] from a
+        framed stream (/stack, /minipix/series), following its pages. A
+        stream that drops is resumed from the last frame received (frames
+        already in hand are not repeated), within the client's retry
+        budget."""
+        head, heads, planes, seen = None, [], [], set()
         t1, attempts = lo, self._attempts()
         while True:
             end = None
             try:
-                for head, pixels in self._stack_records(
-                    seg, x0, y0, nx, ny, t1, hi, band
-                ):
-                    if head["kind"] == "frame":
-                        frame = FrameInfo.from_json(head)
-                        ident = (frame.frame_key, frame.epoch)
+                for rec, pixels in self._records(path, params, t1, hi, band):
+                    kind = rec["kind"]
+                    if kind == "frame":
+                        ident = (rec.get("frame_key"), float(rec["epoch"]))
                         if ident not in seen:
                             seen.add(ident)
-                            frames.append(frame)
+                            heads.append(rec)
                             planes.append(pixels)
-                    elif head["kind"] == "end":
-                        end = head
+                    elif kind == "end":
+                        end = rec
+                    elif head is None:
+                        head = rec
                 if end is None:
-                    raise DecodeError(
-                        f"stack/{seg}: stream ended without its end record"
-                    )
+                    raise DecodeError(f"{path}: stream ended without its end record")
             except (TransportError, DecodeError, ServerError) as exc:
                 if (
                     isinstance(exc, ServerError)
@@ -628,18 +636,18 @@ class Client:
                 time.sleep(delay)
                 # resume at the last epoch received: frames sharing it may
                 # repeat, and `seen` drops them
-                t1 = frames[-1].epoch if frames else t1
+                t1 = float(heads[-1]["epoch"]) if heads else t1
                 continue
             attempts = self._attempts()
             next(attempts)
             if not end.get("truncated") or end.get("next_t1") is None:
-                return frames, planes
+                return head, heads, planes
             t1 = float(end["next_t1"])
 
-    def _stack_records(self, seg, x0, y0, nx, ny, t1, t2, band):
-        """The decoded records of one /stack request, as they arrive."""
-        path = f"stack/{int(seg)}"
-        params = {"x0": x0, "y0": y0, "nx": nx, "ny": ny, "t1": t1, "t2": t2}
+    def _records(self, path, params, t1, t2, band):
+        """The decoded records of one framed-stream request, as they
+        arrive."""
+        params = dict(params, t1=t1, t2=t2)
         if band:
             params["band"] = band
         try:
@@ -709,6 +717,39 @@ class Client:
         )
 
     # ── catalogs and minipixes ─────────────────────────────────────────
+
+    def minipix_series(self, seg, idx, t1=None, t2=None, *, band=None):
+        """One minipix's archived cutouts in [t1, t2] (default: all), with
+        each frame's data-quality and photometric-calibration records, as a
+        :class:`MinipixSeries`. These are the cutouts the pipeline kept for
+        an active minipix, from the minipix store; :meth:`minipix_stack`
+        instead cuts the same window out of the archived segment frames.
+        Raises NotFound when the minipix has no cutouts in the window."""
+        if "minipix_series" not in self.meta().raw.get("features", ()):
+            raise ExplorerError("this server does not offer /minipix/series")
+        lo, hi = self._window(t1, t2)
+        head, heads, planes = self._stream(
+            f"minipix/series/{int(seg)}/{int(idx)}", {}, lo, hi, self._band(band)
+        )
+        if head is None:
+            raise DecodeError(f"minipix/series/{seg}/{idx}: no head record")
+        return MinipixSeries.from_records(head, heads, planes, self.provenance())
+
+    def minipix_series_at(self, ra, dec, t1=None, t2=None, *, band=None):
+        """:meth:`minipix_series` of the minipix holding (ra, dec). Where
+        segments overlap, the cutouts live in one of them, so each segment
+        containing the position is tried in turn. Returns
+        ``(series, x, y)``: the series and the position's cutout pixel."""
+        grid = self.meta().minipix_grid
+        for seg, px, py in sky.segments_containing(ra, dec):
+            idx = sky.minipix_index(px, py, grid)
+            try:
+                series = self.minipix_series(seg, idx, t1, t2, band=band)
+            except NotFound:
+                continue
+            x, y = series.radec_to_pixel(ra, dec)
+            return series, float(x), float(y)
+        raise NoData(f"no minipix cutouts at ra={ra}, dec={dec}")
 
     def transients(self):
         """{"events": [...], "trails": [...]} (served empty until the
