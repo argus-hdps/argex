@@ -127,11 +127,12 @@ them from the server's `/minipix/series` stream as a `MinipixSeries`, a
 
 `zeropoint(x, y, gr)` evaluates that model at a cutout pixel for a source
 of color g - r; `dq(x, y, radius)` ORs the flags of the quadrants an
-aperture touches; `photometry(x, y, radius, annulus, gr=, exptime=, bad=)`
-measures every frame and returns an astropy Table of fluxes, calibrated AB
-magnitudes in each frame's band, DQ flags and a `good` mask. The FITS
-writer adds the records to the `FRAMES` table. `minipix_stack` is different:
-it cuts the same window out of the archived segment frames.
+aperture touches; `records(x, y, gr)` lists both records per frame as an
+astropy Table. Measuring fluxes is left to standard tools such as
+photutils. The FITS writer adds the records to the `FRAMES` table, and
+`argex.read(path)` reads any cutout, stack or minipix-series file back as
+the same object, records included. `minipix_stack` is different: it cuts
+the same window out of the archived segment frames.
 
 `stack` reads the server's `/stack` stream: every frame in the window,
 cropped server-side, in one response per few thousand frames, decoded as

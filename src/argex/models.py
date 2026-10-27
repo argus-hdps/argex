@@ -608,8 +608,9 @@ class MinipixSeries(CutoutStack):
       null or the frame has none (``has_photocal[k]`` False): the frame was
       not calibrated, or the minipix centre was off it.
 
-    A calibrated magnitude is ``zeropoint(x, y, gr) - 2.5 log10(flux)``;
-    :meth:`photometry` does the whole measurement."""
+    A calibrated magnitude is ``zeropoint(x, y, gr) - 2.5 log10(flux)``,
+    with the flux measured as the pipeline measured the calibrators it was
+    fitted to."""
 
     idx: int = -1
     dq_or: np.ndarray | None = None  # (n, 4) uint32
@@ -785,90 +786,6 @@ class MinipixSeries(CutoutStack):
             },
         )
 
-    def photometry(
-        self,
-        x,
-        y,
-        radius=4.0,
-        annulus=(8.0, 13.0),
-        *,
-        gr=None,
-        exptime=None,
-        bad=dqflags.BAD,
-    ):
-        """Circular-aperture photometry of the source at cutout pixel (x, y)
-        in every frame, calibrated with its photocal record. Returns an
-        astropy Table, one row per frame:
-
-        ``epoch`` (s), ``mjd`` (TT), ``band``, ``telescope_config``,
-        ``frame_key``; ``flux``, ``flux_err``, ``bkg`` (e-/s, the background
-        per pixel); ``zp`` (at (x, y) and ``gr``), ``mag``, ``mag_err`` (AB
-        in the frame's band); ``dq`` (flags of the quadrants the aperture
-        touches) and ``good``: calibrated, a finite positive flux, and none
-        of the ``bad`` flags under the aperture.
-
-        The background is the annulus median, its noise 1.4826 x the
-        annulus MAD; pixels of the annulus off the cutout are not used.
-        ``flux_err`` combines the background noise in the aperture and in
-        the background estimate, plus the source's photon noise when the
-        frames' ``exptime`` (s) is given. ``mag_err`` is the flux error
-        alone: the records carry no zeropoint uncertainty."""
-        from astropy.table import Table
-
-        ny, nx = self.data.shape[1:]
-        weights = _aperture_weights((ny, nx), x, y, radius)
-        yy, xx = np.mgrid[:ny, :nx]
-        d2 = (xx - x) ** 2 + (yy - y) ** 2
-        ring = (d2 >= annulus[0] ** 2) & (d2 < annulus[1] ** 2)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)  # all-NaN annuli
-            sky_px = self.data[:, ring]
-            bkg = np.nanmedian(sky_px, axis=1)
-            sigma = 1.4826 * np.nanmedian(np.abs(sky_px - bkg[:, None]), axis=1)
-            n_sky = np.isfinite(sky_px).sum(axis=1)
-            flux = ((self.data - bkg[:, None, None]) * weights).sum(axis=(1, 2))
-            area, w2 = weights.sum(), (weights**2).sum()
-            var = sigma**2 * (w2 + area**2 * (np.pi / 2) / np.maximum(n_sky, 1))
-            if exptime is not None:
-                var = var + np.clip(flux, 0, None) / float(exptime)
-            flux_err = np.sqrt(var)
-            zp = self.zeropoint(x, y, gr)
-            mag = zp - 2.5 * np.log10(flux)
-            mag_err = 2.5 / np.log(10) * flux_err / flux
-        flags = self.dq(x, y, radius + 0.5)
-        good = (
-            np.isfinite(zp) & np.isfinite(flux) & (flux > 0) & ((flags & int(bad)) == 0)
-        )
-        epochs = self.epochs
-        return Table(
-            {
-                "epoch": epochs,
-                "mjd": times.to_mjd(epochs) if len(self) else np.empty(0),
-                "band": [f.band or "" for f in self.frames],
-                "telescope_config": [f.telescope_config for f in self.frames],
-                "frame_key": [
-                    f.frame_key if f.frame_key is not None else -1 for f in self.frames
-                ],
-                "flux": flux,
-                "flux_err": flux_err,
-                "bkg": bkg,
-                "zp": zp,
-                "mag": mag,
-                "mag_err": mag_err,
-                "dq": flags,
-                "good": good,
-            },
-            meta={
-                "seg": self.seg,
-                "idx": self.idx,
-                "x": float(x),
-                "y": float(y),
-                "radius": float(radius),
-                "annulus": tuple(map(float, annulus)),
-                "gr": gr,
-            },
-        )
-
     def frames_table(self):
         """The FRAMES table with each frame's DQ and photocal records."""
         table = super().frames_table()
@@ -889,16 +806,6 @@ class MinipixSeries(CutoutStack):
         return out
 
 
-def _aperture_weights(shape, x, y, radius, supersample=5):
-    """Fraction of each pixel inside a circle, by supersampling."""
-    ny, nx = shape
-    sub = (np.arange(supersample) + 0.5) / supersample - 0.5
-    yy = np.arange(ny)[:, None, None, None] + sub[None, None, :, None]
-    xx = np.arange(nx)[None, :, None, None] + sub[None, None, None, :]
-    inside = (xx - x) ** 2 + (yy - y) ** 2 <= radius**2
-    return inside.mean(axis=(2, 3))
-
-
 def _product_header(wcs, cards):
     """The WCS header (less its placeholder MJDREF) extended with cards."""
     header = wcs.to_header()
@@ -909,3 +816,83 @@ def _product_header(wcs, cards):
 
 def _opt_float(value):
     return None if value is None else float(value)
+
+
+def read(path):
+    """A :class:`Cutout`, :class:`CutoutStack` or :class:`MinipixSeries` from
+    a FITS file its ``writeto`` wrote (a path, URL or file object; the image
+    may be tile-compressed). The frame identities, records and processing
+    versions come back from the headers and the FRAMES table."""
+    with fits.open(path) as hdul:
+        image = next(h for h in hdul if h.is_image and h.data is not None)
+        header = image.header
+        data = np.asarray(image.data, np.float32)
+        provenance = Provenance(
+            header.get("PROCVER"), header.get("SRVPROC"), header.get("ARGEXVER", "")
+        )
+        seg = int(header["TANSEGID"])
+        x0, y0 = int(header["CUTORGX"]), int(header["CUTORGY"])
+        if "FRAMES" not in hdul:
+            return Cutout(seg, x0, y0, data, _frame_from_header(seg, header), provenance)
+        table = hdul["FRAMES"]
+        rows = table.data
+        frames = tuple(_frame_from_row(seg, r) for r in rows)
+        if "MINIPIX" not in table.header:
+            return CutoutStack(seg, x0, y0, data, frames, provenance)
+        return MinipixSeries(
+            seg,
+            x0,
+            y0,
+            data,
+            frames,
+            provenance,
+            idx=int(table.header["MINIPIX"]),
+            dq_or=np.asarray(rows["DQ_OR"], np.uint32).reshape(-1, 4),
+            n_flagged=np.asarray(rows["DQ_NFLAG"], np.uint16).reshape(-1, 4),
+            has_dq=np.asarray(rows["HAS_DQ"], bool),
+            zp=np.asarray(rows["ZP"], np.float64).reshape(-1, 3),
+            grad_x=np.asarray(rows["ZP_GRADX"], np.float64),
+            grad_y=np.asarray(rows["ZP_GRADY"], np.float64),
+            color=np.asarray(rows["ZP_COLOR"], np.float64),
+            has_photocal=np.asarray(rows["HAS_CAL"], bool),
+            gr_pivot=float(table.header["GRPIVOT"]),
+            gradient_px=int(table.header["GRADPX"]),
+        )
+
+
+def _frame_from_header(seg, h):
+    return FrameInfo(
+        seg=seg,
+        epoch=float(h["ARGEPOCH"]),
+        epoch_256=int(h["ARGE256"]),
+        telescope_config=int(h["TELCONF"]),
+        frame_key=h.get("FRAMEKEY"),
+        camera=h.get("CAMID"),
+        band=h.get("BAND"),
+        format=int(h["ARGFMT"]),
+        checksum=int(h["ARGCKSUM"]),
+        data_file=str(h["ARGFILE"]),
+        byte_offset=int(h["ARGOFFS"]),
+        clamped=bool(h.get("ARGCLAMP", False)),
+        fill=bool(h.get("ARGFILL", False)),
+        requested_t=_opt_float(h.get("ARGREQT")),
+        offset_s=_opt_float(h.get("ARGDT")),
+    )
+
+
+def _frame_from_row(seg, r):
+    key = int(r["FRAMEKEY"])
+    return FrameInfo(
+        seg=seg,
+        epoch=float(r["EPOCH"]),
+        epoch_256=int(r["EPOCH256"]),
+        telescope_config=int(r["TELCONF"]),
+        frame_key=None if key < 0 else key,
+        camera=str(r["CAMID"]).strip() or None,
+        band=str(r["BAND"]).strip() or None,
+        format=int(r["ARGFMT"]),
+        checksum=int(r["ARGCKSUM"]),
+        data_file=str(r["ARGFILE"]).strip(),
+        byte_offset=int(r["ARGOFFS"]),
+        fill=bool(r["FILLED"]),
+    )

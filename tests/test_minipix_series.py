@@ -1,7 +1,7 @@
 """Client.minipix_series: decoding the /minipix/series stream into a
-MinipixSeries, the photocal zeropoint model, aperture photometry against a
-synthetic star of known flux, DQ masking, paging and resuming, and finding a
-minipix by position."""
+MinipixSeries, the photocal zeropoint model, DQ flags under an aperture,
+the per-frame records table, paging and resuming, and finding a minipix by
+position."""
 
 import math
 
@@ -13,7 +13,6 @@ from astropy.io import fits
 import argex
 from argex import sky
 from conftest import (
-    BKG,
     CR_FRAME,
     MINIPIX,
     RED,
@@ -22,7 +21,6 @@ from conftest import (
     STAR_XY,
     UNCALIBRATED,
     FakeServer,
-    star_flux,
     star_zp,
 )
 
@@ -76,28 +74,6 @@ def test_dq_under_an_aperture(series):
     assert (np.delete(flags, CR_FRAME) == 0).all()
     assert rho.dq(4.0, 4.0, 3.0)[CR_FRAME] == 0  # SW only
     assert argex.dq.quadrants(15.5, 15.5, 1.0) == [0, 1, 2, 3]
-
-
-def test_photometry_recovers_the_star(series):
-    rho = series.select(band="rho")
-    lc = rho.photometry(*STAR_XY, radius=7.0, annulus=(9.0, 14.0), gr=0.6)
-    assert len(lc) == 12 and lc.meta["idx"] == MINIPIX[1]
-    want = np.array([star_flux(i) for i in range(12)])
-    np.testing.assert_allclose(lc["flux"], want, rtol=2e-3)
-    np.testing.assert_allclose(lc["bkg"], BKG, rtol=1e-3)
-    zp = rho.zeropoint(*STAR_XY)
-    ok = np.isfinite(zp)
-    np.testing.assert_allclose(
-        lc["mag"][ok], (zp - 2.5 * np.log10(want))[ok], atol=3e-3
-    )
-    assert list(np.flatnonzero(~lc["good"])) == [CR_FRAME, UNCALIBRATED]
-    assert np.isnan(lc["mag"][UNCALIBRATED])
-    # a noiseless background leaves only the photon noise, when asked for
-    assert (lc["flux_err"] < 1e-2).all()
-    with_photons = rho.photometry(*STAR_XY, radius=7.0, annulus=(9.0, 14.0), exptime=60)
-    np.testing.assert_allclose(
-        with_photons["flux_err"], np.sqrt(with_photons["flux"] / 60), rtol=1e-2
-    )
 
 
 def test_series_pages_and_resumes():
@@ -175,3 +151,31 @@ def test_records_table(series):
     np.testing.assert_allclose(table["zp_at"], rho.zeropoint(*STAR_XY, 1.1))
     assert table["utc"][0].startswith("2026-")
     assert "zp_at" not in rho.records().colnames
+
+
+def test_read_round_trips_the_fits_products(series, tmp_path):
+    path = tmp_path / "series.fits"
+    series.writeto(path)
+    got = argex.read(path)
+    assert isinstance(got, argex.MinipixSeries) and got.idx == series.idx
+    np.testing.assert_array_equal(got.data, series.data)
+    assert got.frames == series.frames
+    for name in ("dq_or", "n_flagged", "has_dq", "has_photocal"):
+        np.testing.assert_array_equal(getattr(got, name), getattr(series, name))
+    rho, rho_got = series.select(band="rho"), got.select(band="rho")
+    np.testing.assert_array_equal(
+        rho_got.zeropoint(*STAR_XY, 1.1), rho.zeropoint(*STAR_XY, 1.1)
+    )
+    assert rho_got.dq(*STAR_XY, 4.0)[CR_FRAME] == argex.dq.Flags.COSMIC_RAY
+
+    stack = argex.CutoutStack(
+        series.seg, series.x0, series.y0, series.data, series.frames, series.provenance
+    )
+    stack.writeto(tmp_path / "stack.fits")
+    got = argex.read(tmp_path / "stack.fits")
+    assert type(got) is argex.CutoutStack and got.frames == stack.frames
+
+    series[3].writeto(tmp_path / "cut.fits")
+    got = argex.read(tmp_path / "cut.fits")
+    assert isinstance(got, argex.Cutout) and got.frame == series.frames[3]
+    np.testing.assert_array_equal(got.data, series.data[3])

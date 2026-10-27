@@ -33,6 +33,7 @@ from .models import (  # noqa: E402
     SegmentTable,
     Tile,
     TileBatch,
+    read,
 )
 
 __all__ = [
@@ -58,6 +59,7 @@ __all__ = [
     "TransportError",
     "UnknownBand",
     "dq",
+    "read",
     "sky",
     "times",
     "wire",

@@ -45,8 +45,7 @@ class Flags(IntFlag):
     NO_REFERENCE = 1 << 26  # no difference-imaging reference here
 
 
-#: Flags that make a pixel's value unusable for photometry: the default
-#: ``bad`` set of :meth:`argex.MinipixSeries.photometry`.
+#: Flags that make a pixel's value unusable for photometry.
 BAD = (
     Flags.DEAD_PIXEL
     | Flags.HOT_PIXEL
