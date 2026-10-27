@@ -7,7 +7,7 @@ server (`applications/data_explorer` in
 identity and provenance. Dependencies: `httpx`, `numpy`, `astropy`.
 
 ```bash
-pip install git+https://github.com/argus-hdps/argex     # or, in a checkout: pip install -e .
+pip install argex     # or, in a checkout: pip install -e .
 ```
 
 ## Quick start
